@@ -43,17 +43,18 @@ class PriorityAnalyzer:
         """
         Calcula prioridade de um projeto específico.
 
-        Fatores considerados:
-        - Completude (documentação, memory system)
-        - Atividade git (commits recentes)
-        - Tipo de projeto (produção > desenvolvimento)
-        - Se é monorepo (geralmente mais importante)
-        - Número de subprojetos (complexidade)
+        Fatores (score 0-4, 0 = máxima prioridade):
+        - Documentação completa: -1.0
+        - Memory system: -0.5
+        - Git recente (gradual): -1.0 a 0
+        - Monorepo com subprojetos: -0.5 a -1.0
+        - Framework produção: -0.5
+        - Subprojetos (complexidade): -0.5
+        - Duplicatas: +0.5
 
         Returns:
             Dicionário com score e breakdown
         """
-        # Buscar projeto
         cursor = self.conn.execute(
             "SELECT * FROM projects WHERE name = ? AND parent_project_id IS NULL",
             (project_name,)
@@ -65,74 +66,105 @@ class PriorityAnalyzer:
 
         project = dict(project)
 
-        # Cálculo de score (0-4, 0 = máxima prioridade)
-        score = 3  # Default: média prioridade
-
+        score = 4.0  # Começa com prioridade mínima, fatores reduzem
         breakdown = {}
 
-        # 1. Documentação completa (-1 ponto = mais prioritário)
+        # 1. Documentação completa (-1.0 max)
         doc_score = 0
         if project['has_claude_md']:
-            doc_score += 1
+            doc_score += 0.5
         if project['has_context_md']:
-            doc_score += 0.5
+            doc_score += 0.25
         if project['has_readme']:
-            doc_score += 0.5
+            doc_score += 0.25
+        score -= doc_score
+        breakdown['documentation'] = f'{doc_score:.1f} pontos (-{doc_score:.1f})'
 
-        if doc_score >= 2:
-            score -= 1
-            breakdown['documentation'] = 'Completa (-1)'
-        else:
-            breakdown['documentation'] = 'Incompleta (+0)'
-
-        # 2. Sistema de memória (-1 ponto)
+        # 2. Sistema de memória (-0.5)
         if project['has_memory_system']:
-            score -= 1
-            breakdown['memory_system'] = 'Presente (-1)'
+            score -= 0.5
+            breakdown['memory_system'] = 'Presente (-0.5)'
         else:
             breakdown['memory_system'] = 'Ausente (+0)'
 
-        # 3. Atividade Git recente (-1 ponto)
+        # 3. Atividade Git recente (gradual: -1.0 a 0)
+        git_reduction = 0
         if project['git_last_commit_date']:
             try:
                 last_commit = datetime.fromisoformat(project['git_last_commit_date'].split()[0])
                 days_ago = (datetime.now() - last_commit).days
 
-                if days_ago <= 7:
-                    score -= 1
-                    breakdown['git_activity'] = f'Muito recente ({days_ago}d) (-1)'
+                if days_ago <= 3:
+                    git_reduction = 1.0
+                elif days_ago <= 7:
+                    git_reduction = 0.8
+                elif days_ago <= 14:
+                    git_reduction = 0.6
                 elif days_ago <= 30:
-                    score -= 0.5
-                    breakdown['git_activity'] = f'Recente ({days_ago}d) (-0.5)'
+                    git_reduction = 0.4
+                elif days_ago <= 90:
+                    git_reduction = 0.2
                 else:
-                    breakdown['git_activity'] = f'Antiga ({days_ago}d) (+0)'
+                    git_reduction = 0
+
+                score -= git_reduction
+                breakdown['git_activity'] = f'{days_ago}d atrás (-{git_reduction:.1f})'
             except:
                 breakdown['git_activity'] = 'Indeterminada (+0)'
         else:
             breakdown['git_activity'] = 'Sem commits (+0)'
 
-        # 4. Monorepo (geralmente mais importante) (-0.5 ponto)
+        # 4. Monorepo com subprojetos (-0.5 a -1.0)
+        subproject_count = 0
         if project['is_monorepo']:
-            score -= 0.5
-            breakdown['monorepo'] = 'Sim (-0.5)'
+            cursor2 = self.conn.execute(
+                "SELECT COUNT(*) as cnt FROM projects WHERE parent_project_id = ?",
+                (project['id'],)
+            )
+            subproject_count = cursor2.fetchone()['cnt']
+
+            if subproject_count > 5:
+                score -= 1.0
+                breakdown['monorepo'] = f'Sim, {subproject_count} subprojetos (-1.0)'
+            elif subproject_count > 0:
+                score -= 0.5
+                breakdown['monorepo'] = f'Sim, {subproject_count} subprojetos (-0.5)'
+            else:
+                score -= 0.3
+                breakdown['monorepo'] = 'Sim, sem subprojetos detectados (-0.3)'
         else:
             breakdown['monorepo'] = 'Não (+0)'
 
-        # 5. Framework conhecido (projetos de produção) (-0.5 ponto)
-        if project['framework'] in ['nextjs', 'nestjs']:
+        # 5. Framework de produção (-0.5)
+        if project['framework'] in ['nextjs', 'nestjs', 'laravel']:
             score -= 0.5
             breakdown['framework'] = f"{project['framework']} (-0.5)"
+        elif project['framework'] in ['express', 'vite']:
+            score -= 0.25
+            breakdown['framework'] = f"{project['framework']} (-0.25)"
         else:
-            breakdown['framework'] = f"{project['framework'] or 'unknown'} (+0)"
+            breakdown['framework'] = f"{project['framework'] or 'nenhum'} (+0)"
 
-        # Limitar entre 0 e 4
-        score = max(0, min(4, score))
+        # 6. Duplicatas (penalizar projetos duplicados: +0.5)
+        cursor3 = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM projects WHERE name = ? AND parent_project_id IS NULL",
+            (project_name,)
+        )
+        dup_count = cursor3.fetchone()['cnt']
+        if dup_count > 1:
+            score += 0.5
+            breakdown['duplicates'] = f'{dup_count} cópias (+0.5)'
+        else:
+            breakdown['duplicates'] = 'Único (+0)'
+
+        score = max(0, min(4, round(score, 1)))
 
         return {
             'project': project_name,
-            'score': round(score, 1),
+            'score': score,
             'breakdown': breakdown,
             'final_priority': self._score_to_label(score),
+            'subproject_count': subproject_count,
         }
 
     def _score_to_label(self, score: float) -> str:

@@ -143,7 +143,9 @@ class ProjectScanner:
         projects = self._scan_recursive(location_path, depth=0)
         stats['projects_found'] = len(projects)
 
-        # Processar projetos encontrados
+        # === PASSE 1: Inserir/atualizar todos os projetos (sem hierarquia) ===
+        path_to_id = {}
+
         for project_info in projects:
             if project_info['depth_level'] > stats['max_depth_found']:
                 stats['max_depth_found'] = project_info['depth_level']
@@ -155,10 +157,31 @@ class ProjectScanner:
                     self._update_project(existing['id'], project_info)
                     stats['projects_updated'] += 1
                     self.log(f"Atualizado: {project_info['name']}")
+                path_to_id[project_info['path']] = existing['id']
             else:
-                self._insert_project(project_info)
+                project_id = self._insert_project(project_info)
                 stats['projects_added'] += 1
                 self.log(f"Adicionado: {project_info['name']}")
+                path_to_id[project_info['path']] = project_id
+
+        # === PASSE 2: Resolver hierarquia pai/filho com IDs reais ===
+        hierarchy_updates = 0
+        for project_info in projects:
+            parent_path = project_info.get('parent_path')
+            if parent_path and parent_path in path_to_id:
+                project_path = project_info['path']
+                if project_path in path_to_id:
+                    parent_db_id = path_to_id[parent_path]
+                    project_db_id = path_to_id[project_path]
+                    self.conn.execute(
+                        "UPDATE projects SET parent_project_id = ?, is_subproject = 1 WHERE id = ?",
+                        (parent_db_id, project_db_id)
+                    )
+                    hierarchy_updates += 1
+
+        if hierarchy_updates > 0:
+            self.conn.commit()
+            self.log(f"Hierarquia resolvida: {hierarchy_updates} relações pai/filho")
 
         # Salvar histórico de scan
         duration = time.time() - start_time
@@ -171,14 +194,14 @@ class ProjectScanner:
 
         return stats
 
-    def _scan_recursive(self, path: Path, depth: int, parent_id: int = None) -> List[Dict]:
+    def _scan_recursive(self, path: Path, depth: int, parent_path: str = None) -> List[Dict]:
         """
         Escaneia recursivamente em busca de projetos.
 
         Args:
             path: Caminho atual
             depth: Profundidade atual
-            parent_id: ID do projeto pai (se houver)
+            parent_path: Path do projeto pai (para resolução posterior)
 
         Returns:
             Lista de dicionários com informações de projetos
@@ -189,33 +212,33 @@ class ProjectScanner:
         projects = []
 
         # Verificar se este diretório é um projeto
-        project_info = self._detect_project(path, depth, parent_id)
+        project_info = self._detect_project(path, depth, parent_path)
 
         if project_info:
             projects.append(project_info)
-            current_parent_id = project_info.get('temp_id')  # Será substituído pelo ID real
+            current_parent_path = project_info['path']
         else:
-            current_parent_id = parent_id
+            current_parent_path = parent_path
 
         # Escanear subdiretórios (exceto os ignorados)
         try:
             for item in path.iterdir():
                 if item.is_dir() and item.name not in self.IGNORE_DIRS:
-                    sub_projects = self._scan_recursive(item, depth + 1, current_parent_id)
+                    sub_projects = self._scan_recursive(item, depth + 1, current_parent_path)
                     projects.extend(sub_projects)
         except PermissionError:
             self.log(f"Sem permissão: {path}", "WARN")
 
         return projects
 
-    def _detect_project(self, path: Path, depth: int, parent_id: int = None) -> Optional[Dict]:
+    def _detect_project(self, path: Path, depth: int, parent_path: str = None) -> Optional[Dict]:
         """
         Detecta se um diretório é um projeto e extrai metadados.
 
         Args:
             path: Caminho do diretório
             depth: Profundidade atual
-            parent_id: ID do projeto pai
+            parent_path: Path do projeto pai (para resolução posterior)
 
         Returns:
             Dicionário com informações do projeto ou None
@@ -231,9 +254,9 @@ class ProjectScanner:
             'path': str(path.resolve()),
             'type': project_type,
             'depth_level': depth,
-            'parent_project_id': parent_id,
-            'is_subproject': parent_id is not None,
-            'temp_id': str(path.resolve()),  # Temporário para hierarquia
+            'parent_path': parent_path,  # Path do pai para resolução em 2 passes
+            'parent_project_id': None,   # Será preenchido no passe 2
+            'is_subproject': parent_path is not None,
         }
 
         # Detectar monorepo
